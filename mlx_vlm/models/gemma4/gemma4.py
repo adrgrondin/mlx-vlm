@@ -233,6 +233,11 @@ class Model(nn.Module):
                     continue
                 if "vision_tower" not in k and "audio_tower" not in k:
                     continue
+            # Gemma 4 QAT mobile KV-cache quantization scales are stored in the
+            # checkpoint but consumed by the quantized cache (Phase 4), not the
+            # model. Drop them so strict weight loading ignores them.
+            if "k_cache_scale" in k or "v_cache_scale" in k:
+                continue
             if "rotary_emb.inv_freq" in k or "rotary_emb" in k:
                 continue
             if self.audio_tower is None and ("audio_tower" in k or "embed_audio" in k):
@@ -243,8 +248,18 @@ class Model(nn.Module):
             else:
                 new_key = k
 
-            if new_key.startswith("language_model.") and not new_key.startswith(
-                "language_model.model."
+            # Untied lm_head lives under ``language_model`` (not
+            # ``language_model.model``), so map it before the generic
+            # ``language_model.X`` -> ``language_model.model.X`` rule.
+            # The ``language_model.lm_head.`` exclusion makes this idempotent for
+            # already-converted MLX checkpoints (whose keys are already in the
+            # ``language_model.lm_head.*`` / ``language_model.model.*`` layout).
+            if new_key.startswith("lm_head."):
+                new_key = "language_model." + new_key
+            elif (
+                new_key.startswith("language_model.")
+                and not new_key.startswith("language_model.model.")
+                and not new_key.startswith("language_model.lm_head.")
             ):
                 rest = new_key[len("language_model.") :]
                 new_key = "language_model.model." + rest

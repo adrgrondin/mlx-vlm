@@ -546,6 +546,11 @@ class LanguageModel(nn.Module):
                     "input_min",
                     "output_max",
                     "output_min",
+                    # Gemma 4 QAT mobile KV-cache quantization scales are stored in the
+                    # checkpoint but consumed by the quantized cache (Phase 4), not
+                    # the model. Drop them so strict weight loading ignores them.
+                    "k_cache_scale",
+                    "v_cache_scale",
                 )
             ):
                 continue
@@ -600,6 +605,21 @@ class LanguageModel(nn.Module):
 
     def make_cache(self):
         first_kv_shared = self.args.num_hidden_layers - self.args.num_kv_shared_layers
+        # Gemma 4 QAT mobile: use the precomputed static KV-cache scales for a
+        # hybrid 4-bit (global) / 8-bit (local) quantized cache when present.
+        kv_scales = getattr(self.model, "_gemma_kv_scales", None)
+        if kv_scales:
+            from ...quantization.gemma_mobile_cache import (
+                build_gemma_static_caches,
+            )
+
+            return build_gemma_static_caches(
+                self.args.layer_types,
+                kv_scales,
+                self.args.sliding_window,
+                num_kv_shared_layers=self.args.num_kv_shared_layers,
+                num_hidden_layers=self.args.num_hidden_layers,
+            )
         caches = []
         for i in range(first_kv_shared):
             if self.args.layer_types[i] == "full_attention":

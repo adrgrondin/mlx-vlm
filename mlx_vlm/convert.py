@@ -1,5 +1,6 @@
 import argparse
 import glob
+import json
 import shutil
 from pathlib import Path
 from typing import Callable, Optional, Union
@@ -13,6 +14,9 @@ from .utils import (
     create_model_card,
     fetch_from_hub,
     get_model_path,
+    load_config,
+    load_processor,
+    make_shards,
     save_config,
     save_weights,
     skip_multimodal_module,
@@ -28,6 +32,202 @@ QUANT_RECIPES = [
     "mixed_4_6",
     "mixed_4_8",
 ]
+
+# Gemma 4 QAT mobile (wNa8o8) conversion modes, selected via --quant-predicate.
+GEMMA_MOBILE_MODES = ["gemma_mobile", "gemma_mobile_ptq"]
+
+
+def _resolve_compute_dtype(dtype, config):
+    """Resolve the MLX compute/save dtype for the gemma mobile conversion."""
+    if dtype is not None:
+        return getattr(mx, dtype)
+    src = (
+        config.get("text_config", {}).get("dtype")
+        or config.get("dtype")
+        or "float16"
+    )
+    return getattr(mx, src, mx.float16)
+
+
+def _load_raw_weights(model_path):
+    """Load every ``*.safetensors`` file in ``model_path`` into one dict."""
+    weight_files = sorted(
+        wf for wf in glob.glob(str(model_path / "*.safetensors"))
+    )
+    if not weight_files:
+        raise FileNotFoundError(f"No safetensors found in {model_path}")
+    weights = {}
+    for wf in weight_files:
+        weights.update(mx.load(wf))
+    return weights
+
+
+def _save_weights_dict(save_path, weights):
+    """Save a flat ``{key: mx.array}`` dict as sharded safetensors + index."""
+    save_path.mkdir(parents=True, exist_ok=True)
+    shards = make_shards(weights)
+    shards_count = len(shards)
+    shard_file_format = (
+        "model-{:05d}-of-{:05d}.safetensors"
+        if shards_count > 1
+        else "model.safetensors"
+    )
+    total_size = sum(v.nbytes for v in weights.values())
+    index_data = {"metadata": {"total_size": total_size}, "weight_map": {}}
+    for i, shard in enumerate(shards):
+        shard_name = shard_file_format.format(i + 1, shards_count)
+        mx.save_safetensors(
+            str(save_path / shard_name), shard, metadata={"format": "mlx"}
+        )
+        for weight_name in shard:
+            index_data["weight_map"][weight_name] = shard_name
+    index_data["weight_map"] = {
+        k: index_data["weight_map"][k] for k in sorted(index_data["weight_map"])
+    }
+    with open(save_path / "model.safetensors.index.json", "w") as f:
+        json.dump(index_data, f, indent=4)
+
+
+def _gemma_mobile_num_layers(target) -> int:
+    """Best-effort layer count for selecting the E2B/E4B PTQ config."""
+    layers = getattr(target, "layers", None)
+    if layers is None:
+        lm = getattr(target, "language_model", None)
+        layers = getattr(lm, "layers", None) if lm is not None else None
+    return len(layers) if layers is not None else 0
+
+
+def _convert_gemma_mobile(
+    model_path: Path,
+    mlx_path: Path,
+    mode: str,
+    text_only: bool,
+    dtype: Optional[str],
+    upload_repo: Optional[str],
+    trust_remote_code: bool,
+    revision: Optional[str],
+):
+    """Convert a Gemma 4 checkpoint to the MLX QAT mobile (wNa8o8) format.
+
+    ``mode="transcode"``: lossless remap of an HF ``-mobile-transformers``
+    checkpoint (packed weights preserved bit-exact). Recommended — the QAT
+    checkpoints are already trained for this format.
+    ``mode="ptq"``: post-training quantization of an *unquantized* Gemma 4
+    checkpoint into the mobile format. Lower quality than QAT; useful for
+    custom fine-tunes.
+    """
+    from .quantization.gemma_mobile import replace_with_gemma_quant_layers
+    from .quantization.gemma_mobile_quantize import (
+        cast_gemma_mobile_weights,
+        is_gemma_mobile_checkpoint,
+        promote_text_config,
+        quantize_model_gemma_mobile,
+        select_mobile_quant_config,
+        transcode_gemma_mobile_weights,
+    )
+
+    mlx_path = Path(mlx_path)
+    mlx_path.mkdir(parents=True, exist_ok=True)
+    config = load_config(
+        model_path, trust_remote_code=trust_remote_code, revision=revision
+    )
+    compute_dtype = _resolve_compute_dtype(dtype, config)
+
+    if mode == "transcode":
+        qc = config.get("quantization_config") or config.get("text_config", {}).get(
+            "quantization_config"
+        )
+        if qc is None or qc.get("quant_method") != "gemma":
+            raise ValueError(
+                "Transcode requires a source with quant_method='gemma' "
+                "(an HF -mobile-transformers checkpoint). Use gemma_mobile_ptq "
+                "to quantize an unquantized Gemma 4."
+            )
+        print("[INFO] Transcoding Gemma 4 QAT mobile checkpoint (lossless)")
+        weights = _load_raw_weights(model_path)
+        if not is_gemma_mobile_checkpoint(weights):
+            raise ValueError("Source does not look like a Gemma mobile checkpoint.")
+        weights = transcode_gemma_mobile_weights(weights, text_only=text_only)
+        weights = cast_gemma_mobile_weights(weights, compute_dtype)
+        if text_only:
+            config = promote_text_config(config)
+        _save_weights_dict(mlx_path, weights)
+        processor = None  # loaded from the target after files + config are saved
+    else:  # ptq
+        print("[INFO] PTQ-quantizing Gemma 4 into the mobile format")
+        model, config, _ = fetch_from_hub(
+            model_path, lazy=True, trust_remote_code=trust_remote_code
+        )
+        processor = None
+        target = (
+            model.language_model._model
+            if getattr(model, "_is_text_model", False)
+            else model
+        )
+        num_layers = _gemma_mobile_num_layers(target)
+        qc = select_mobile_quant_config(num_layers)
+        new_weights, _ = quantize_model_gemma_mobile(
+            target, qc, dtype=compute_dtype
+        )
+        target = replace_with_gemma_quant_layers(
+            target, qc, new_weights, dtype=compute_dtype
+        )
+        target.load_weights(list(new_weights.items()), strict=False)
+        mx.eval(target.parameters())
+        config["quantization_config"] = qc
+        config["quantization"] = qc
+        save_weights(mlx_path, target, donate_weights=True)
+
+    # Copy Python and JSON files (except the index, already regenerated).
+    # For text-only transcode, skip the multimodal image/audio processor configs
+    # so the target loads as a clean text-only (tokenizer-only) checkpoint.
+    _text_only_skip = {"preprocessor_config.json", "processor_config.json"}
+    for pattern in ["*.py", "*.json", "*.jinja"]:
+        for file in glob.glob(str(model_path / pattern)):
+            fname = Path(file).name
+            if fname == "model.safetensors.index.json":
+                continue
+            if text_only and mode == "transcode" and fname in _text_only_skip:
+                continue
+            shutil.copy(file, mlx_path)
+    # Copy folders (tokenizer assets, etc.).
+    for item in model_path.iterdir():
+        if item.is_dir():
+            dest = mlx_path / item.name
+            if dest.exists():
+                shutil.rmtree(dest)
+            shutil.copytree(item, dest)
+
+    save_config(config, mlx_path / "config.json")
+
+    # For text-only transcode, strip the multimodal ``processor_class`` from
+    # ``tokenizer_config.json`` so ``AutoProcessor`` resolves to a
+    # tokenizer-only processor instead of the full ``Gemma4Processor`` (which
+    # requires a vision/audio feature extractor that we deliberately dropped).
+    if text_only and mode == "transcode":
+        tok_cfg_path = mlx_path / "tokenizer_config.json"
+        if tok_cfg_path.exists():
+            with open(tok_cfg_path) as f:
+                tok_cfg = json.load(f)
+            if "processor_class" in tok_cfg:
+                tok_cfg.pop("processor_class")
+                with open(tok_cfg_path, "w") as f:
+                    json.dump(tok_cfg, f, indent=2)
+
+    # Load the processor from the (now complete) target so a text-only transcode
+    # resolves to a tokenizer-only processor, then re-save it in canonical form.
+    processor = load_processor(
+        mlx_path,
+        add_detokenizer=False,
+        eos_token_ids=config.get("eos_token_id", None),
+        trust_remote_code=trust_remote_code,
+    )
+    processor.save_pretrained(mlx_path)
+
+    hf_repo = None if Path(str(model_path)).exists() else str(model_path)
+    create_model_card(mlx_path, hf_repo)
+    if upload_repo is not None:
+        upload_to_hub(mlx_path, upload_repo)
 
 
 def _quantization_params(
@@ -295,9 +495,27 @@ def convert(
     dequantize: bool = False,
     trust_remote_code: bool = True,
     quant_predicate: Optional[str] = None,
+    gemma_mobile_text_only: bool = True,
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
+
+    # Gemma 4 QAT mobile (wNa8o8) conversion: transcode (lossless) or PTQ.
+    # These are distinct from the affine nn.quantize path below, so handle them
+    # before instantiating the full model.
+    if quant_predicate in GEMMA_MOBILE_MODES:
+        _convert_gemma_mobile(
+            model_path,
+            mlx_path,
+            mode="ptq" if quant_predicate == "gemma_mobile_ptq" else "transcode",
+            text_only=gemma_mobile_text_only,
+            dtype=dtype,
+            upload_repo=upload_repo,
+            trust_remote_code=trust_remote_code,
+            revision=revision,
+        )
+        return
+
     model, config, processor = fetch_from_hub(
         model_path, lazy=True, trust_remote_code=trust_remote_code
     )
@@ -511,10 +729,24 @@ def configure_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--quant-predicate",
-        help=f"Mixed-bit quantization recipe.",
-        choices=QUANT_RECIPES,
+        help=(
+            "Mixed-bit quantization recipe, or a Gemma 4 QAT mobile mode: "
+            "'gemma_mobile' (lossless transcode of an HF -mobile-transformers "
+            "checkpoint) or 'gemma_mobile_ptq' (post-training quantization of "
+            "an unquantized Gemma 4)."
+        ),
+        choices=QUANT_RECIPES + GEMMA_MOBILE_MODES,
         type=str,
         required=False,
+    )
+    parser.add_argument(
+        "--gemma-mobile-text-only",
+        help=(
+            "For gemma_mobile transcode: extract a text-only checkpoint (drop "
+            "vision/audio encoders). Default: True."
+        ),
+        action=argparse.BooleanOptionalAction,
+        default=True,
     )
     parser.add_argument(
         "--upload-repo",

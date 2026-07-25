@@ -21,12 +21,35 @@ from transformers import AutoProcessor
 from transformers.processing_utils import ProcessorMixin
 
 from .models.base import BaseImageProcessor
+from .quantization.gemma_mobile import (
+    is_gemma_quant_config,
+    precompile_gemma_mobile_kernels,
+    replace_with_gemma_quant_layers,
+)
 from .quantization.one_bit import _quantization_for_path, replace_one_bit_modules
 from .tokenizer_utils import load_tokenizer
 from .trainer.utils import apply_lora_layers
 
 # Modes that support activation quantization
 ACTIVATION_QUANTIZATION_MODES = {"nvfp4", "mxfp8"}
+
+
+# Dtypes accepted for the Gemma 4 QAT mobile compute path.
+_GEMMA_MOBILE_DTYPES = {"bfloat16": mx.bfloat16, "float16": mx.float16}
+
+
+def _gemma_mobile_dtype(config: dict) -> mx.Dtype:
+    """Resolve the compute dtype for Gemma mobile quantized layers.
+
+    The packed int weights dequantize into this dtype so the matmul matches the
+    rest of the model. Falls back to float16.
+    """
+    dtype = (
+        config.get("text_config", {}).get("dtype")
+        or config.get("dtype")
+        or "float16"
+    )
+    return _GEMMA_MOBILE_DTYPES.get(dtype, mx.float16)
 
 # Constants
 MODEL_REMAPPING = {
@@ -709,6 +732,22 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         config["quantization"] = transformed_quantization
         config["quantization_config"] = transformed_quantization
 
+    # Gemma 4 QAT mobile: extract KV-cache quantization scales before sanitize
+    # drops them (Phase 4 static hybrid KV cache). Stored on the text model for
+    # ``make_cache`` to consume.
+    if (
+        quantization_config is not None
+        and quantization_config.get("quant_method") == "gemma"
+    ):
+        from .quantization.gemma_mobile_cache import extract_gemma_kv_scales
+
+        _kv_scales = extract_gemma_kv_scales(weights)
+        if _kv_scales:
+            _lm = getattr(model, "language_model", None)
+            _text_model = getattr(_lm, "model", None) if _lm is not None else None
+            if _text_model is not None:
+                _text_model._gemma_kv_scales = _kv_scales
+
     # Sanitize weights
     weights = sanitize_weights(model, weights)
 
@@ -763,6 +802,11 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 from .models.deepseek_v4.language import make_quantization_config
 
                 quantization = make_quantization_config(model)
+            elif quant_method == "gemma":
+                # Gemma 4 QAT mobile (wNa8o8): per-channel int2/4/8 weights with
+                # static int8 activations. Leaves are swapped for Gemma quantized
+                # counterparts below; this is not compatible with nn.quantize.
+                quantization = dict(quantization_config)
             elif quant_method in ("awq", "gptq", "bitnet"):
                 logging.warning(
                     "Quantization method %s is not supported in mlx_vlm.load_model()",
@@ -780,54 +824,74 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
                 config[quantization_key] = quantization_value
 
     if (quantization := config.get("quantization", None)) is not None:
-        # Handle legacy models which may or may not have vision quantized
-        # TODO: Re-upload the models with the new quantization config and remove this
-        skip_vision = config.get("vision_config", {}).get("skip_vision", False)
-        quantized_model = (
-            model.language_model._model
-            if getattr(model, "_is_text_model", False)
-            else model
-        )
+        if quantization.get("quant_method") == "gemma":
+            # Gemma 4 QAT mobile (wNa8o8): swap nn.Linear/nn.Embedding leaves for
+            # GemmaQuantizedLinear/Embedding using the checkpoint's per-module bit
+            # widths. Weights stay packed (uint8/int8) in memory; dequant happens
+            # transiently inside each matmul. nn.quantize is not used for this format.
+            quantized_model = (
+                model.language_model._model
+                if getattr(model, "_is_text_model", False)
+                else model
+            )
+            replace_with_gemma_quant_layers(
+                quantized_model,
+                quantization,
+                weights,
+                dtype=_gemma_mobile_dtype(config),
+            )
+            # Precompile all custom Metal kernels so the first prompt doesn't
+            # pay the ~0.5 s JIT compilation cost (issue: first-run prompt tok/s).
+            precompile_gemma_mobile_kernels(_gemma_mobile_dtype(config))
+        else:
+            # Handle legacy models which may or may not have vision quantized
+            # TODO: Re-upload the models with the new quantization config and remove this
+            skip_vision = config.get("vision_config", {}).get("skip_vision", False)
+            quantized_model = (
+                model.language_model._model
+                if getattr(model, "_is_text_model", False)
+                else model
+            )
 
-        # Stock MLX rejects bits=1; route those layers to our Metal kernel.
-        replace_one_bit_modules(quantized_model, quantization, weights)
+            # Stock MLX rejects bits=1; route those layers to our Metal kernel.
+            replace_one_bit_modules(quantized_model, quantization, weights)
 
-        def get_class_predicate(p, m):
-            # Skip legacy multimodal layers unless the checkpoint has quantized
-            # tensors for this exact module.
-            if (
-                skip_multimodal_module(p)
-                and skip_vision
-                and not _has_quantized_weights(p, weights)
-            ):
-                return False
-            # Skip 1-bit layers already replaced above.
-            if _quantization_for_path(config["quantization"], p).get("bits") == 1:
-                return False
-            # Handle custom per layer quantizations. Config keys from the
-            # underlying text checkpoint omit the mlx-vlm ``language_model.``
-            # wrapper prefix that loaded module paths carry, so also match with
-            # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
-            override = config["quantization"].get(p)
-            if override is None and p.startswith("language_model."):
-                override = config["quantization"].get(p[len("language_model.") :])
-            if isinstance(override, dict):
-                return override
-            if not hasattr(m, "to_quantized"):
-                return False
-            # Skip layers not divisible by 64
-            if hasattr(m, "weight") and m.weight.size % 64 != 0:
-                return False
-            # Handle legacy models which may not have everything quantized
-            return f"{p}.scales" in weights
+            def get_class_predicate(p, m):
+                # Skip legacy multimodal layers unless the checkpoint has quantized
+                # tensors for this exact module.
+                if (
+                    skip_multimodal_module(p)
+                    and skip_vision
+                    and not _has_quantized_weights(p, weights)
+                ):
+                    return False
+                # Skip 1-bit layers already replaced above.
+                if _quantization_for_path(config["quantization"], p).get("bits") == 1:
+                    return False
+                # Handle custom per layer quantizations. Config keys from the
+                # underlying text checkpoint omit the mlx-vlm ``language_model.``
+                # wrapper prefix that loaded module paths carry, so also match with
+                # that prefix stripped (e.g. per-layer 8-bit MoE router gates).
+                override = config["quantization"].get(p)
+                if override is None and p.startswith("language_model."):
+                    override = config["quantization"].get(p[len("language_model.") :])
+                if isinstance(override, dict):
+                    return override
+                if not hasattr(m, "to_quantized"):
+                    return False
+                # Skip layers not divisible by 64
+                if hasattr(m, "weight") and m.weight.size % 64 != 0:
+                    return False
+                # Handle legacy models which may not have everything quantized
+                return f"{p}.scales" in weights
 
-        nn.quantize(
-            quantized_model,
-            group_size=quantization["group_size"],
-            bits=quantization["bits"],
-            mode=quantization.get("mode", "affine"),
-            class_predicate=get_class_predicate,
-        )
+            nn.quantize(
+                quantized_model,
+                group_size=quantization["group_size"],
+                bits=quantization["bits"],
+                mode=quantization.get("mode", "affine"),
+                class_predicate=get_class_predicate,
+            )
 
     if kwargs.get("quantize_activations", False):
         if quantization is None:

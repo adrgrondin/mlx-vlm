@@ -207,20 +207,46 @@ class Attention(nn.Module):
     ) -> mx.array:
         B, L, _ = x.shape
 
-        queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
+        # P4: fused q/k/v projection for Gemma mobile quantized layers.  When
+        # the three projections are gemma-quantized and share an input SRQ scale
+        # (the common case), a single Metal matmul replaces three launches.
+        fused_qkv = None
+        if (
+            shared_kv is None
+            and not self.use_k_eq_v
+            and getattr(self.q_proj, "mode", None) == "gemma"
+        ):
+            from ...quantization.gemma_mobile import gemma_fused_qkv_matmul
+
+            fused_qkv = gemma_fused_qkv_matmul(self, x)
+
+        if fused_qkv is not None:
+            qd = self.n_heads * self.head_dim
+            kvd = self.n_kv_heads * self.head_dim
+            queries = fused_qkv[..., :qd].reshape(B, L, self.n_heads, self.head_dim)
+            keys = fused_qkv[..., qd : qd + kvd].reshape(
+                B, L, self.n_kv_heads, self.head_dim
+            )
+            values = fused_qkv[..., qd + kvd :].reshape(
+                B, L, self.n_kv_heads, self.head_dim
+            )
+        else:
+            queries = self.q_proj(x).reshape(B, L, self.n_heads, self.head_dim)
+            if shared_kv is None:
+                keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
+                # k_eq_v: values from raw k_proj (before k_norm)
+                if self.use_k_eq_v:
+                    values = keys
+                else:
+                    values = self.v_proj(x).reshape(
+                        B, L, self.n_kv_heads, self.head_dim
+                    )
+
         queries = self.q_norm(queries)
 
         if shared_kv is not None:
             keys, values = shared_kv
         else:
-            keys = self.k_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
-
-            # k_eq_v: values from raw k_proj (before k_norm)
-            if self.use_k_eq_v:
-                values = keys
-            else:
-                values = self.v_proj(x).reshape(B, L, self.n_kv_heads, self.head_dim)
-
             offset = mx.array(cache.offset) if cache is not None else 0
 
             keys = self.k_norm(keys)
@@ -658,9 +684,17 @@ class LanguageModel(nn.Module):
         self.model_type = config.model_type
         self.model = Gemma4TextModel(config)
         self.final_logit_softcapping = getattr(config, "final_logit_softcapping", None)
+        # Untied output head (Gemma 4 QAT mobile checkpoints set
+        # ``tie_word_embeddings: false`` and ship a separate 2-bit ``lm_head``).
+        self.tie_word_embeddings = getattr(config, "tie_word_embeddings", True)
+        if not self.tie_word_embeddings:
+            self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def logits_from_hidden(self, hidden: mx.array) -> mx.array:
-        logits = self.model.embed_tokens.as_linear(hidden)
+        if self.tie_word_embeddings:
+            logits = self.model.embed_tokens.as_linear(hidden)
+        else:
+            logits = self.lm_head(hidden)
         if self.final_logit_softcapping is not None:
             logits = logit_softcap(self.final_logit_softcapping, logits)
         return logits
@@ -857,6 +891,23 @@ class LanguageModel(nn.Module):
         return predicate
 
     def make_cache(self):
+        # Gemma 4 QAT mobile: use the precomputed static KV-cache scales for a
+        # hybrid 4-bit (global) / 8-bit (local) quantized cache when present.
+        kv_scales = getattr(self.model, "_gemma_kv_scales", None)
+        if kv_scales:
+            from ...quantization.gemma_mobile_cache import (
+                build_gemma_static_caches,
+            )
+
+            return build_gemma_static_caches(
+                self.config.layer_types,
+                kv_scales,
+                self.config.sliding_window,
+                num_kv_shared_layers=getattr(
+                    self.config, "num_kv_shared_layers", 0
+                ),
+                num_hidden_layers=self.config.num_hidden_layers,
+            )
         caches = []
         for layer_type in self.config.layer_types[
             : self.model.first_kv_shared_layer_idx
@@ -866,8 +917,5 @@ class LanguageModel(nn.Module):
             else:
                 caches.append(
                     RotatingKVCache(
-                        max_size=self.config.sliding_window,
-                        keep=0,
-                    )
-                )
+                        max_size=self.config.sliding_window, keep=0))
         return caches
