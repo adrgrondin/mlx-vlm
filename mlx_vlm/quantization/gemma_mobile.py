@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 from mlx.utils import tree_map_with_path
 
 # ---------------------------------------------------------------------------
@@ -900,6 +901,72 @@ class GemmaQuantizedLinear(nn.Module):
         )
 
 
+class MmapEmbeddingLookup:
+    """On-disk (CPU-mmap) lookup for a large packed embedding table.
+
+    The packed ``embedding_quantized`` table is held as a read-only ``mmap`` view
+    of the safetensors file (demand-paged by the OS).  Per-token row gathers page
+    in only the needed rows, so the full table never enters MLX unified memory.
+    This mirrors LiteRT-LM's ``EmbeddingLookupText``, which places large
+    embedding tables on the CPU because they "may use too much memory on the
+    accelerator".
+
+    Only the small gathered row block is transferred to MLX; the dequantization
+    (unpack + scale) is done on the MLX side via
+    ``GemmaQuantizedEmbedding._dequant_rows``.
+    """
+
+    def __init__(self, safetensors_path, quant_key, num_bits, embedding_dim):
+        import json as _json
+        import mmap as _mmap
+        import struct as _struct
+
+        self.safetensors_path = safetensors_path
+        self.quant_key = quant_key
+        self.num_bits = num_bits
+        self.embedding_dim = embedding_dim
+
+        self._f = open(safetensors_path, "rb")
+        hlen = _struct.unpack("<Q", self._f.read(8))[0]
+        header = _json.loads(self._f.read(hlen))
+        data_start = 8 + hlen
+
+        if quant_key not in header:
+            self._f.close()
+            raise KeyError(
+                f"Tensor {quant_key!r} not found in {safetensors_path}"
+            )
+        info = header[quant_key]
+        off0, _ = info["data_offsets"]
+        shape = info["shape"]
+        dtype_str = info["dtype"]
+
+        # U8 -> numpy uint8 (int2/int4 packed), I8 -> numpy int8 (int8).
+        np_dtype = np.uint8 if dtype_str == "U8" else np.int8
+        self._mm = _mmap.mmap(self._f.fileno(), 0, access=_mmap.ACCESS_READ)
+        count = int(shape[0]) * int(shape[1])
+        self._quant = np.frombuffer(
+            self._mm, dtype=np_dtype, count=count, offset=data_start + off0
+        ).reshape(shape)
+
+    def gather(self, ids_np):
+        """Return the packed rows (uint8/int8 numpy) for the given token ids."""
+        return self._quant[ids_np]
+
+    def close(self):
+        # Release the numpy view before closing the mmap (otherwise the view's
+        # exported pointer prevents ``mmap.close``).
+        self._quant = None
+        try:
+            self._mm.close()
+        except Exception:
+            pass
+        try:
+            self._f.close()
+        except Exception:
+            pass
+
+
 class GemmaQuantizedEmbedding(nn.Module):
     """Embedding with packed int2/4/8 table and per-row (or block-wise) scale.
 
@@ -960,12 +1027,51 @@ class GemmaQuantizedEmbedding(nn.Module):
         scaled = ints.astype(out_dtype) * scale_rows[..., None].astype(out_dtype)
         return scaled.reshape(scaled.shape[:-2] + (-1,))
 
+    def offload_to_mmap(self, safetensors_path: str, quant_key: str) -> None:
+        """Offload the packed embedding table to an on-disk mmap lookup.
+
+        Replaces the (possibly lazy) ``embedding_quantized`` parameter with a
+        tiny dummy and stores an :class:`MmapEmbeddingLookup` so subsequent
+        ``__call__`` invocations gather rows from disk instead of from unified
+        memory.  The per-row ``embedding_scale`` (small) stays resident for the
+        dequant multiply.
+
+        Must be called AFTER ``load_weights`` (so the table shape/dtype is known)
+        and BEFORE ``mx.eval(model.parameters())`` (so the full table is never
+        materialized into unified memory).
+        """
+        lookup = MmapEmbeddingLookup(
+            safetensors_path, quant_key, self.num_bits, self.embedding_dim
+        )
+        object.__setattr__(self, "_mmap_lookup", lookup)
+        # Use dict setitem (not object.__setattr__) so the old array is dropped
+        # from the module's parameter dict and actually freed; ``parameters()``
+        # then sees the 1-element dummy and never materializes the full table.
+        w_dtype = self["embedding_quantized"].dtype
+        self["embedding_quantized"] = mx.zeros((1,), dtype=w_dtype)
+
     @property
     def weight(self) -> mx.array:
         """Full dequantized table (without architectural embed_scale)."""
+        if getattr(self, "_mmap_lookup", None) is not None:
+            # Rare path (tied lm_head / input_embeddings): materialize the full
+            # table on demand from the mmap.  This pages the whole table into
+            # memory and defeats the offload, but standard generation (untied
+            # lm_head, as in Gemma 4 QAT mobile) never calls this.
+            all_ids = mx.arange(self.num_embeddings, dtype=mx.int32)
+            return self.__call__(all_ids)
         return self._dequant_rows(self.embedding_quantized, self.embedding_scale)
 
     def __call__(self, input_ids: mx.array) -> mx.array:
+        lookup = getattr(self, "_mmap_lookup", None)
+        if lookup is not None:
+            # Gather packed rows from the on-disk mmap (CPU), transfer only the
+            # small row block to MLX, then dequantize on-device.  The full table
+            # stays paged out on disk.
+            ids_np = np.asarray(input_ids)
+            quant_rows = mx.array(lookup.gather(ids_np))
+            scales = self.embedding_scale[input_ids]
+            return self._dequant_rows(quant_rows, scales)
         rows = self.embedding_quantized[input_ids]
         scales = self.embedding_scale[input_ids]
         return self._dequant_rows(rows, scales)
@@ -1152,6 +1258,80 @@ def replace_with_gemma_quant_layers(
     _strip_clippable_linear_clips(model)
 
     return model
+
+
+def offload_gemma_embeddings(
+    model: nn.Module,
+    weight_files,
+    min_size_bytes: int = 8 * 1024 * 1024,
+) -> int:
+    """Offload large ``GemmaQuantizedEmbedding`` tables to on-disk mmap lookups.
+
+    For every ``GemmaQuantizedEmbedding`` whose packed table exceeds
+    ``min_size_bytes``, replace the in-memory ``embedding_quantized`` with an
+    :class:`MmapEmbeddingLookup` backed by the safetensors file.  The full table
+    then never enters MLX unified memory; per-token row gathers page in only the
+    needed rows (mirrors LiteRT-LM's ``EmbeddingLookupText``).
+
+    Must be called AFTER ``model.load_weights`` (so table shapes are known) and
+    BEFORE ``mx.eval(model.parameters())`` (so the full table is never
+    materialized).
+
+    Returns the number of embedding tables offloaded.
+    """
+    import json as _json
+    import os as _os
+    import struct as _struct
+
+    if _os.environ.get("MLX_VLM_NO_EMBED_OFFLOAD") or not weight_files:
+        return 0
+
+    # Map every "*.embedding_quantized" safetensors key to its file + shape.
+    emb_keys = {}  # key -> (file_path, shape)
+    for wf in weight_files:
+        try:
+            with open(wf, "rb") as f:
+                hlen = _struct.unpack("<Q", f.read(8))[0]
+                header = _json.loads(f.read(hlen))
+        except (OSError, ValueError):
+            continue
+        for k, info in header.items():
+            if k.endswith(".embedding_quantized"):
+                emb_keys[k] = (str(wf), tuple(info["shape"]))
+
+    if not emb_keys:
+        return 0
+
+    quantized_model = (
+        model.language_model._model
+        if getattr(model, "_is_text_model", False)
+        else model
+    )
+
+    n_offloaded = 0
+    for path, module in quantized_model.named_modules():
+        if not isinstance(module, GemmaQuantizedEmbedding):
+            continue
+        quant = module["embedding_quantized"]
+        shape = tuple(quant.shape)
+        size = int(shape[0]) * int(shape[1]) if len(shape) == 2 else 0
+        if size < min_size_bytes:
+            continue
+
+        quant_key = f"{path}.embedding_quantized"
+        info = emb_keys.get(quant_key)
+        if info is None:
+            # Fallback: match by shape (unique for Gemma 4's two big tables).
+            matches = [k for k, v in emb_keys.items() if v[1] == shape]
+            if len(matches) != 1:
+                continue
+            quant_key = matches[0]
+
+        file_path = emb_keys[quant_key][0]
+        module.offload_to_mmap(file_path, quant_key)
+        n_offloaded += 1
+
+    return n_offloaded
 
 
 # ---------------------------------------------------------------------------

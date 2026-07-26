@@ -14,9 +14,11 @@ from mlx.utils import tree_flatten
 from mlx_vlm.quantization.gemma_mobile import (
     GemmaQuantizedEmbedding,
     GemmaQuantizedLinear,
+    MmapEmbeddingLookup,
     _strip_clippable_linear_clips,
     apply_srq,
     dequantize_weight,
+    offload_gemma_embeddings,
     replace_with_gemma_quant_layers,
     resolve_module_bits,
     unpack_int,
@@ -504,3 +506,194 @@ def test_replace_strips_clippable_clips_end_to_end():
     assert ffw.use_clipping is False
     for attr in ("input_min", "input_max", "output_min", "output_max"):
         assert not hasattr(ffw, attr)
+
+
+# ---------------------------------------------------------------------------
+# On-disk mmap embedding offload (Phase 1 memory optimization)
+# ---------------------------------------------------------------------------
+
+def _write_safetensors(path, tensors):
+    """Write a minimal safetensors file.  ``tensors``: {name: (bytes, dtype_str, shape)}."""
+    import json
+    import struct
+
+    header = {}
+    offset = 0
+    data = b""
+    for name, (db, dtype_str, shape) in tensors.items():
+        header[name] = {
+            "dtype": dtype_str,
+            "shape": list(shape),
+            "data_offsets": [offset, offset + len(db)],
+        }
+        offset += len(db)
+        data += db
+    hjson = json.dumps(header, separators=(",", ":")).encode()
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", len(hjson)))
+        f.write(hjson)
+        f.write(data)
+
+
+def _make_offload_embedding(num_emb, dim, num_bits, seed=0):
+    """Build a per-row GemmaQuantizedEmbedding with random packed weights + scale."""
+    rng = np.random.default_rng(seed)
+    W = rng.standard_normal((num_emb, dim)).astype(np.float32)
+    q, scale = _quant_per_channel(W, num_bits)
+    pack_fn = _pack_int2_row if num_bits == 2 else _pack_int4_row
+    packed = np.stack([pack_fn(r) for r in q])
+    emb = GemmaQuantizedEmbedding(num_emb, dim, num_bits, dtype=mx.float32, num_blocks=1)
+    emb.embedding_quantized = mx.array(packed)
+    emb.embedding_scale = mx.array(scale)
+    return emb
+
+
+@pytest.mark.parametrize("num_bits", [2, 4])
+def test_offload_embedding_matches_in_memory(tmp_path, num_bits):
+    """Offloaded __call__ (mmap gather + MLX dequant) matches the in-memory path."""
+    num_emb, dim = 32, 16
+    emb = _make_offload_embedding(num_emb, dim, num_bits, seed=1)
+    packed_np = np.array(emb.embedding_quantized)
+    scale_np = np.array(emb.embedding_scale)
+    path = tmp_path / "emb.safetensors"
+    _write_safetensors(str(path), {
+        "emb.embedding_quantized": (packed_np.tobytes(), "U8", packed_np.shape),
+        "emb.embedding_scale": (scale_np.tobytes(), "F32", scale_np.shape),
+    })
+    ids = mx.array([0, 3, 7, 15, 31])
+    ref = emb(ids)
+    mx.eval(ref)
+    emb.offload_to_mmap(str(path), "emb.embedding_quantized")
+    assert getattr(emb, "_mmap_lookup", None) is not None
+    got = emb(ids)
+    mx.eval(got)
+    np.testing.assert_allclose(np.array(got), np.array(ref), atol=1e-6)
+
+
+def test_offload_frees_dict_item(tmp_path):
+    """offload_to_mmap replaces the dict item so parameters() sees the dummy."""
+    emb = _make_offload_embedding(32, 16, 2, seed=2)
+    packed_np = np.array(emb.embedding_quantized)
+    scale_np = np.array(emb.embedding_scale)
+    path = tmp_path / "emb.safetensors"
+    _write_safetensors(str(path), {
+        "emb.embedding_quantized": (packed_np.tobytes(), "U8", packed_np.shape),
+        "emb.embedding_scale": (scale_np.tobytes(), "F32", scale_np.shape),
+    })
+    assert emb["embedding_quantized"].shape == packed_np.shape
+    emb.offload_to_mmap(str(path), "emb.embedding_quantized")
+    # Both the attribute and the dict item must be the 1-element dummy so the
+    # full table is actually freed (object.__setattr__ would leave the dict item).
+    assert emb.embedding_quantized.shape == (1,)  # attribute -> dict
+    assert emb["embedding_quantized"].shape == (1,)  # dict item
+    assert emb.parameters()["embedding_quantized"].shape == (1,)  # parameters()
+
+
+def test_offload_weight_materializes_on_demand(tmp_path):
+    """The weight property materializes the full table from the mmap (rare path)."""
+    emb = _make_offload_embedding(16, 8, 4, seed=3)
+    packed_np = np.array(emb.embedding_quantized)
+    scale_np = np.array(emb.embedding_scale)
+    path = tmp_path / "emb.safetensors"
+    _write_safetensors(str(path), {
+        "emb.embedding_quantized": (packed_np.tobytes(), "U8", packed_np.shape),
+        "emb.embedding_scale": (scale_np.tobytes(), "F32", scale_np.shape),
+    })
+    ref_weight = emb.weight
+    mx.eval(ref_weight)
+    emb.offload_to_mmap(str(path), "emb.embedding_quantized")
+    got_weight = emb.weight
+    mx.eval(got_weight)
+    np.testing.assert_allclose(np.array(got_weight), np.array(ref_weight), atol=1e-6)
+
+
+def test_offload_gemma_embeddings_selects_by_size(tmp_path):
+    """offload_gemma_embeddings offloads tables above the size threshold only."""
+    big = _make_offload_embedding(64, 128, 4, seed=4)  # 64 * 64 = 4096 bytes
+    small = _make_offload_embedding(8, 16, 2, seed=5)  # 8 * 4 = 32 bytes
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = big
+            self.embed_tokens_per_layer = small
+
+        def __call__(self, x):
+            return self.embed_tokens(x)
+
+    model = M()
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(str(path), {
+        "embed_tokens.embedding_quantized": (
+            np.array(big.embedding_quantized).tobytes(),
+            "U8",
+            np.array(big.embedding_quantized).shape,
+        ),
+        "embed_tokens.embedding_scale": (
+            np.array(big.embedding_scale).tobytes(),
+            "F32",
+            np.array(big.embedding_scale).shape,
+        ),
+        "embed_tokens_per_layer.embedding_quantized": (
+            np.array(small.embedding_quantized).tobytes(),
+            "U8",
+            np.array(small.embedding_quantized).shape,
+        ),
+        "embed_tokens_per_layer.embedding_scale": (
+            np.array(small.embedding_scale).tobytes(),
+            "F32",
+            np.array(small.embedding_scale).shape,
+        ),
+    })
+    n = offload_gemma_embeddings(model, [str(path)], min_size_bytes=100)
+    assert n == 1
+    assert getattr(model.embed_tokens, "_mmap_lookup", None) is not None
+    assert getattr(model.embed_tokens_per_layer, "_mmap_lookup", None) is None
+    # The offloaded (large) table still produces correct output.
+    ids = mx.array([0, 10, 40, 63])
+    ref = big(ids)
+    mx.eval(ref)
+    got = model.embed_tokens(ids)
+    mx.eval(got)
+    np.testing.assert_allclose(np.array(got), np.array(ref), atol=1e-6)
+
+
+def test_offload_gemma_embeddings_env_disable(tmp_path):
+    """MLX_VLM_NO_EMBED_OFFLOAD=1 disables offloading."""
+    import os
+
+    big = _make_offload_embedding(64, 128, 4, seed=6)
+
+    class M(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = big
+
+        def __call__(self, x):
+            return self.embed_tokens(x)
+
+    model = M()
+    path = tmp_path / "model.safetensors"
+    _write_safetensors(str(path), {
+        "embed_tokens.embedding_quantized": (
+            np.array(big.embedding_quantized).tobytes(),
+            "U8",
+            np.array(big.embedding_quantized).shape,
+        ),
+        "embed_tokens.embedding_scale": (
+            np.array(big.embedding_scale).tobytes(),
+            "F32",
+            np.array(big.embedding_scale).shape,
+        ),
+    })
+    old = os.environ.get("MLX_VLM_NO_EMBED_OFFLOAD")
+    os.environ["MLX_VLM_NO_EMBED_OFFLOAD"] = "1"
+    try:
+        n = offload_gemma_embeddings(model, [str(path)], min_size_bytes=100)
+    finally:
+        if old is None:
+            os.environ.pop("MLX_VLM_NO_EMBED_OFFLOAD", None)
+        else:
+            os.environ["MLX_VLM_NO_EMBED_OFFLOAD"] = old
+    assert n == 0
+    assert getattr(model.embed_tokens, "_mmap_lookup", None) is None

@@ -915,6 +915,20 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
     # native weights and frees mobile weights layer by layer).
     del weights
 
+    # Phase 1 (memory): offload large embedding tables (PLE ~1.17 GB,
+    # embed_tokens ~0.1 GB) to on-disk mmap lookups so they never enter unified
+    # memory.  Must run AFTER load_weights (shapes known) and BEFORE
+    # mx.eval(model.parameters()) (so the full tables are never materialized).
+    # Mirrors LiteRT-LM's EmbeddingLookupText.  Set MLX_VLM_NO_EMBED_OFFLOAD=1
+    # to disable.
+    if _needs_native_precompile:
+        try:
+            from .quantization.gemma_mobile import offload_gemma_embeddings
+
+            offload_gemma_embeddings(model, weight_files)
+        except Exception:
+            pass
+
     if not lazy:
         mx.eval(model.parameters())
 

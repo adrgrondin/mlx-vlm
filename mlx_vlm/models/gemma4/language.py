@@ -162,12 +162,14 @@ def _free_mobile_weights(model):
     # to the mobile-format source arrays).
     mx.eval(*all_native)
 
-    # Now safe to free the mobile-format weights.
+    # Now safe to free the mobile-format weights.  Use dict setitem (not
+    # object.__setattr__) so the old array is dropped from the module's parameter
+    # dict and actually freed from unified memory.
     for module in mobile_modules:
-        w_dtype = module.weight.dtype
-        s_dtype = module.weight_scale.dtype
-        object.__setattr__(module, "weight", mx.zeros((1,), dtype=w_dtype))
-        object.__setattr__(module, "weight_scale", mx.zeros((1,), dtype=s_dtype))
+        w_dtype = module["weight"].dtype
+        s_dtype = module["weight_scale"].dtype
+        module["weight"] = mx.zeros((1,), dtype=w_dtype)
+        module["weight_scale"] = mx.zeros((1,), dtype=s_dtype)
 
 
 def _iter_gemma_quant_linear(layer):
@@ -250,12 +252,16 @@ def precompile_native_functions(model, shapes=(1, 16, 32, 64, 128, 256)):
         if layer_native:
             mx.eval(*layer_native)
 
-        # Free this layer's mobile weights.
+        # Free this layer's mobile weights.  Use dict setitem (not
+        # object.__setattr__) so the old array is dropped from the module's
+        # parameter dict and actually freed from unified memory (object.__setattr__
+        # only shadows the attribute via __dict__, leaving the dict item — and the
+        # materialized array — alive).
         for module in _iter_gemma_quant_linear(layer):
-            w_dtype = module.weight.dtype
-            s_dtype = module.weight_scale.dtype
-            object.__setattr__(module, "weight", mx.zeros((1,), dtype=w_dtype))
-            object.__setattr__(module, "weight_scale", mx.zeros((1,), dtype=s_dtype))
+            w_dtype = module["weight"].dtype
+            s_dtype = module["weight_scale"].dtype
+            module["weight"] = mx.zeros((1,), dtype=w_dtype)
+            module["weight_scale"] = mx.zeros((1,), dtype=s_dtype)
 
     if not any_native:
         return
