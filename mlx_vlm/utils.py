@@ -823,6 +823,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             if quantization_value is not None:
                 config[quantization_key] = quantization_value
 
+    _needs_native_precompile = False
     if (quantization := config.get("quantization", None)) is not None:
         if quantization.get("quant_method") == "gemma":
             # Gemma 4 QAT mobile (wNa8o8): swap nn.Linear/nn.Embedding leaves for
@@ -843,6 +844,13 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             # Precompile all custom Metal kernels so the first prompt doesn't
             # pay the ~0.5 s JIT compilation cost (issue: first-run prompt tok/s).
             precompile_gemma_mobile_kernels(_gemma_mobile_dtype(config))
+
+            # Mark for post-weight-load precompilation of native compiled
+            # functions (Phase 7).  Must run AFTER load_weights because
+            # _qlinear_native_args converts and caches native weights from
+            # m.weight/m.weight_scale — if called before load_weights, the
+            # cached native weights are garbage from uninitialized tensors.
+            _needs_native_precompile = True
         else:
             # Handle legacy models which may or may not have vision quantized
             # TODO: Re-upload the models with the new quantization config and remove this
@@ -902,9 +910,24 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
         model = quantize_activations(model)
 
     model.load_weights(list(weights.items()), strict=strict)
+    # Free the raw weights dict so its arrays don't keep mobile-format
+    # weights alive during native precompilation (which materializes
+    # native weights and frees mobile weights layer by layer).
+    del weights
 
     if not lazy:
         mx.eval(model.parameters())
+
+    # Precompile native quantized_matmul compiled functions for common prompt
+    # lengths and free mobile-format weights (Phase 7).  Must run AFTER
+    # load_weights + mx.eval so the native weight conversion sees the real
+    # packed weights, not uninitialized tensors.
+    if _needs_native_precompile:
+        try:
+            from .models.gemma4.language import precompile_native_functions
+            precompile_native_functions(model)
+        except Exception:
+            pass
 
     model.model_path = model_path
     model.eval()

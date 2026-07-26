@@ -331,8 +331,10 @@ def generate_step(
         if hasattr(lm, "_rope_deltas"):
             lm._rope_deltas = None
 
+    fast_state = None  # compiled decode fast-path state (LiteRT-LM inspired; opt-in)
+
     def _step(y, inputs_embeds=None):
-        nonlocal tokens, kwargs, last_outputs, target_sample_position
+        nonlocal tokens, kwargs, last_outputs, target_sample_position, fast_state
 
         step_kwargs = kwargs
         if speculative_prefill_capture_kwargs:
@@ -341,7 +343,18 @@ def generate_step(
             step_kwargs = {**step_kwargs, "logits_to_keep": 1}
 
         with mx.stream(generation_stream):
-            if "decoder_input_ids" in step_kwargs:
+            # Opt-in compiled single-token decode fast-path (MLX_VLM_FAST_DECODE=1):
+            # used only for plain text decode (no inputs_embeds / cross-attention /
+            # encoder / speculative kwargs).  The prefill and first-token step stay
+            # eager; the fast path takes over for the decode loop.
+            if (
+                fast_state is not None
+                and inputs_embeds is None
+                and "decoder_input_ids" not in step_kwargs
+                and not step_kwargs
+            ):
+                outputs = model.language_model.fast_decode_step(fast_state, y)
+            elif "decoder_input_ids" in step_kwargs:
                 outputs = model.language_model(
                     cache=prompt_cache,
                     **step_kwargs,
@@ -492,6 +505,21 @@ def generate_step(
             sampler_is_greedy=sampler_is_greedy,
         )
         return
+
+    # Opt-in compiled decode fast-path (LiteRT-LM inspired; MLX_VLM_FAST_DECODE=1).
+    # The prefill + first-token step above ran eager (they use inputs_embeds);
+    # the decode loop below switches to the compiled single-token forward for
+    # plain text generation.  Falls back silently to the eager path if the model
+    # does not support it or the KV state cannot be extracted.
+    if (
+        os.environ.get("MLX_VLM_FAST_DECODE", "0") == "1"
+        and not kwargs  # text-only (no cross-attention / encoder outputs)
+        and hasattr(model.language_model, "init_fast_decode")
+    ):
+        try:
+            fast_state = model.language_model.init_fast_decode(prompt_cache)
+        except Exception:
+            fast_state = None
 
     n = 0
     while True:

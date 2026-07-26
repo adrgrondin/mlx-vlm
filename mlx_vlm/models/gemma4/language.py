@@ -1,4 +1,4 @@
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -47,6 +47,532 @@ class RMSNormZeroShift(nn.Module):
 @partial(mx.compile, shapeless=True)
 def logit_softcap(softcap, x):
     return mx.tanh(x / softcap) * softcap
+
+
+# ---------------------------------------------------------------------------
+# Native quantized_matmul compiled decode path (LiteRT-LM inspired).
+#
+# MLX's native ``mx.quantized_matmul`` is 1.03–1.61× faster than the custom
+# qmv Metal kernel for the raw matmul (benchmarked on M5 Max across all
+# bit-widths and realistic sizes).  Crucially, unlike the custom ``metal_kernel``
+# (opaque to ``mx.compile``), the native matmul IS compile-friendly, so
+# ``mx.compile`` fuses the surrounding element-wise ops (RMSNorms, residual
+# adds, gelu, SRQ activations, layer_scalar) with the matmul into a single
+# compiled graph — the true LiteRT-style fusion.
+#
+# The SRQ (static activation quantization) that the custom kernel fuses inline
+# is applied as a compile-friendly element-wise op (``_srq``) that fuses with
+# the adjacent norm/residual.  The KV cache update + SDPA stay EAGER (outside
+# the compiled function) to avoid the O(n²) growing-concat regression.
+#
+# Weight conversion (``mobile_to_mlx``) is bit-exact: the per-channel mobile
+# format maps to group_size=128 with the per-channel scale broadcast and a
+# constant bias of ``-shift * scale``.
+# ---------------------------------------------------------------------------
+
+_NATIVE_GROUP_SIZE = 128
+
+
+def _srq(x, s):
+    """Compile-friendly static fake-quantization (SRQ).
+
+    Matches the custom qmv kernel's internal float32 SRQ:
+    ``clamp(round(x / s), -128, 127) * s``.  When ``s == 0`` the SRQ is a
+    no-op (returns ``x`` unchanged).  ``s`` may be a scalar or per-row array.
+    """
+    s = s.astype(mx.float32)
+    is_zero = s == 0
+    s_safe = mx.where(is_zero, mx.array(1.0, dtype=mx.float32), s)
+    q = mx.clip(mx.round(x.astype(mx.float32) / s_safe), -128.0, 127.0)
+    return mx.where(is_zero, x, q * s_safe)
+
+
+def _qlinear_native_args(m):
+    """Extract native ``mx.quantized_matmul`` arguments from a
+    ``GemmaQuantizedLinear``.
+
+    Returns ``(wq, scales, biases, in_s, out_s)`` where ``wq``, ``scales``,
+    ``biases`` are for ``mx.quantized_matmul(group_size=128)`` and ``in_s``,
+    ``out_s`` are SRQ scales (zero array when the layer has no SRQ).  The
+    weight conversion is bit-exact and cached on the module.
+    """
+    from ...quantization.gemma_mobile import mobile_to_mlx
+
+    cached = getattr(m, "_native_w", None)
+    if cached is None:
+        wq, scales, biases = mobile_to_mlx(
+            m.weight, m.weight_scale, m.num_bits, m.input_dims
+        )
+        object.__setattr__(m, "_native_w", (wq, scales, biases))
+    else:
+        wq, scales, biases = cached
+
+    dtype = m.weight_scale.dtype
+    in_s = m.input_activation_scale if m._has_input_scale else mx.array(
+        [0.0], dtype=dtype
+    )
+    out_s = m.output_activation_scale if m._has_output_scale else mx.array(
+        [0.0], dtype=dtype
+    )
+    return (wq, scales, biases, in_s, out_s)
+
+
+def _free_mobile_weights(model):
+    """Free mobile-format weights after native conversion.
+
+    After ``_qlinear_native_args`` has been called for all decoder layers
+    (triggering lazy conversion to native ``quantized_matmul`` format), this
+    function evaluates all native weights in a single ``mx.eval`` (breaking
+    the lazy references to the mobile-format source arrays) and then replaces
+    the mobile-format ``weight`` / ``weight_scale`` with tiny dummy arrays.
+
+    This recovers ~2 GB of memory since the native compiled path (used for both
+    prefill and decode) no longer needs the mobile-format weights.  The SRQ
+    scales (``input_activation_scale``, ``output_activation_scale``) are
+    preserved because the native path still reads them.
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    text_model = lm.model if hasattr(lm, "model") else lm
+    layers = text_model.layers
+
+    # Collect all native weights (lazy) from all layers that use the native path.
+    all_native = []
+    mobile_modules = []
+    for layer in layers:
+        native = layer._native_args
+        if not native:
+            continue
+        # pre_attn_args and post_attn_args contain the native weights
+        # interleaved with norm weights and SRQ scales.  The native weights
+        # are the ones cached as _native_w on each GemmaQuantizedLinear.
+        for module in _iter_gemma_quant_linear(layer):
+            cached = getattr(module, "_native_w", None)
+            if cached is not None:
+                all_native.extend(cached)
+                mobile_modules.append(module)
+            # Also handle fused qkv
+        fused = getattr(layer.self_attn, "_fused_qkv_native", None)
+        if fused is not None:
+            all_native.extend(fused[:3])  # wq, scales, biases
+
+    if not mobile_modules:
+        return
+
+    # Single eval to materialize all native weights (breaks lazy references
+    # to the mobile-format source arrays).
+    mx.eval(*all_native)
+
+    # Now safe to free the mobile-format weights.
+    for module in mobile_modules:
+        w_dtype = module.weight.dtype
+        s_dtype = module.weight_scale.dtype
+        object.__setattr__(module, "weight", mx.zeros((1,), dtype=w_dtype))
+        object.__setattr__(module, "weight_scale", mx.zeros((1,), dtype=s_dtype))
+
+
+def _iter_gemma_quant_linear(layer):
+    """Yield all GemmaQuantizedLinear modules in a decoder layer."""
+    attn = layer.self_attn
+    mlp = layer.mlp
+    yield attn.q_proj
+    if not attn.is_kv_shared_layer:
+        yield attn.k_proj
+        yield attn.v_proj
+    yield attn.o_proj
+    yield mlp.gate_proj
+    yield mlp.up_proj
+    yield mlp.down_proj
+    if layer.per_layer_input_gate is not None:
+        yield layer.per_layer_input_gate
+        yield layer.per_layer_projection
+
+
+def precompile_native_functions(model, shapes=(1, 16, 32, 64, 128, 256)):
+    """Precompile native compiled functions for common prompt lengths.
+
+    Called at load time (alongside ``precompile_gemma_mobile_kernels``) to
+    eliminate the per-shape ``@mx.compile`` JIT cost that would otherwise be
+    paid on the first forward pass of each unique prompt length.  Also
+    triggers weight conversion and frees mobile-format weights.
+
+    Three critical details that make this work:
+
+    1. **Run AFTER load_weights** — ``_qlinear_native_args`` converts and
+       caches native weights from ``m.weight``/``m.weight_scale``.  If called
+       before ``load_weights``, the cached native weights are garbage from
+       uninitialized tensors.  The caller (``utils.load_model``) ensures this.
+
+    2. **Eval the output** — ``@mx.compile`` traces the function at call time
+       but only generates and caches the Metal shaders when the output graph
+       is *evaluated*.  Calling ``text_model(dummy_ids)`` without ``mx.eval``
+       builds the graph lazily but never compiles.  We must capture and eval the
+       output of each dummy pass.
+
+    3. **Convert + free layer-by-layer** — Instead of materializing all native
+       weights at once (which would peak at mobile + native ≈ 4.5 GB), we
+       convert, eval, and free each layer's mobile weights one at a time.  This
+       keeps the conversion peak at roughly half-mobile + half-native ≈ 3.2 GB.
+
+    4. **Compile via direct function calls, not full forward passes** — Running
+       ``text_model(dummy_ids)`` for each shape accumulates activations across
+       all 35 layers (~0.8 GB for seq_len=256), pushing the peak to 3.9 GB.
+       Instead, we call each unique compiled function directly with a tiny dummy
+       input (~4 MB), triggering compilation with negligible activation memory.
+       Only the first source layer and first KV-shared layer are needed (their
+       compiled functions are shared across all layers via ``lru_cache``).
+    """
+    lm = model.language_model if hasattr(model, "language_model") else model
+    text_model = lm.model if hasattr(lm, "model") else lm
+    layers = getattr(text_model, "layers", None)
+    if layers is None:
+        return
+
+    # Convert, materialize, and free mobile weights layer by layer to keep
+    # peak memory low (mobile + native never coexist in full).
+    any_native = False
+    for layer in layers:
+        native = layer._get_native_args()
+        if not native:
+            continue
+        any_native = True
+
+        # Collect this layer's native weights (lazy) for eval.
+        layer_native = []
+        for module in _iter_gemma_quant_linear(layer):
+            cached = getattr(module, "_native_w", None)
+            if cached is not None:
+                layer_native.extend(cached)
+        fused = getattr(layer.self_attn, "_fused_qkv_native", None)
+        if fused is not None:
+            layer_native.extend(fused[:3])
+
+        # Materialize native weights (breaks lazy refs to mobile weights).
+        if layer_native:
+            mx.eval(*layer_native)
+
+        # Free this layer's mobile weights.
+        for module in _iter_gemma_quant_linear(layer):
+            w_dtype = module.weight.dtype
+            s_dtype = module.weight_scale.dtype
+            object.__setattr__(module, "weight", mx.zeros((1,), dtype=w_dtype))
+            object.__setattr__(module, "weight_scale", mx.zeros((1,), dtype=s_dtype))
+
+    if not any_native:
+        return
+
+    # Pre-set flags so Gemma4TextModel.__call__ doesn't try to free weights
+    # during the dummy passes (it frees on the 2nd forward pass).
+    object.__setattr__(text_model, "_weights_converted", True)
+    object.__setattr__(text_model, "_mobile_weights_freed", True)
+
+    # Compile the @mx.compile functions for common prompt lengths.
+    #
+    # For small shapes (≤ 32 tokens), run the full forward pass — this warms
+    # up both the compiled functions AND the MLX built-in ops (RMSNorm, SDPA,
+    # RoPE, embeddings, per-layer inputs) with negligible activation memory
+    # (~0.1 GB for seq_len=32).  For larger shapes, call the compiled functions
+    # directly with tiny dummy inputs (~4 MB) to avoid accumulating ~0.8 GB
+    # of activations across 35 layers (which pushed the peak to 3.9 GB).
+    #
+    # The compiled functions are shared across layers via lru_cache, so we
+    # only need to call the first source layer and first KV-shared layer for
+    # the direct-compile path.
+    hidden_size = text_model.config.hidden_size
+    per_layer_dim = getattr(text_model, "hidden_size_per_layer_input", 0)
+    dtype = text_model.layers[0].input_layernorm.weight.dtype
+
+    # Find the first source and first KV-shared layer (different compiled fns).
+    first_source = None
+    first_kvshared = None
+    for layer in layers:
+        native = layer._native_args
+        if not native:
+            continue
+        if native[0] and first_source is None:
+            first_source = layer
+        elif not native[0] and first_kvshared is None:
+            first_kvshared = layer
+        if first_source is not None and first_kvshared is not None:
+            break
+
+    compile_layers = [l for l in (first_source, first_kvshared) if l is not None]
+    dummy_offset = mx.array(0)
+    # Shapes small enough that a full forward pass is cheap (< ~0.1 GB activations).
+    full_pass_shapes = {s for s in shapes if s <= 32}
+
+    for seq_len in shapes:
+        if seq_len in full_pass_shapes:
+            # Full forward pass: warms up compiled fns + MLX built-in ops.
+            dummy_ids = mx.array([[2] * seq_len], dtype=mx.int32)
+            try:
+                out = text_model(dummy_ids)
+                mx.eval(out)
+            except Exception:
+                pass
+        else:
+            # Direct compile: call compiled fns with tiny dummy inputs.
+            dummy_x = mx.zeros((1, seq_len, hidden_size), dtype=dtype)
+            dummy_residual = mx.zeros((1, seq_len, hidden_size), dtype=dtype)
+            dummy_attn_out = mx.zeros((1, seq_len, hidden_size), dtype=dtype)
+            dummy_pli = mx.zeros((1, seq_len, per_layer_dim), dtype=dtype)
+
+            for layer in compile_layers:
+                native = layer._native_args
+                if not native:
+                    continue
+                _is_src, pre_fn, pre_args, post_fn, post_args = native
+                try:
+                    pre_out = pre_fn(dummy_x, *pre_args, dummy_offset)
+                    mx.eval(pre_out)
+                except Exception:
+                    pass
+                try:
+                    post_out = post_fn(
+                        dummy_residual, dummy_attn_out, dummy_pli, *post_args
+                    )
+                    mx.eval(post_out)
+                except Exception:
+                    pass
+
+
+def _qlinear_args(m):
+    """Extract mobile-format arguments for ``gemma_mobile_matmul`` (fallback)."""
+    in_s = m.input_activation_scale if m._has_input_scale else mx.array(
+        [0.0], dtype=m.weight_scale.dtype
+    )
+    out_s = m.output_activation_scale if m._has_output_scale else mx.array(
+        [0.0], dtype=m.weight_scale.dtype
+    )
+    return (m.weight, m.weight_scale, m.num_bits, m.input_dims, in_s, out_s)
+
+
+def _get_rope_freqs(attn):
+    """Extract rope frequencies for compiled functions.
+
+    For ``ProportionalRoPE`` (full attention), returns ``rope._freqs`` (includes
+    ``inf`` for non-rotated dims via ``partial_rotary_factor``).  For ``nn.RoPE``
+    (sliding attention), precomputes ``base^(arange(0, dims, 2) / dims)``.
+    """
+    rope = attn.rope
+    freqs = getattr(rope, "_freqs", None)
+    if freqs is not None:
+        return freqs
+    # nn.RoPE: precompute freqs (MLX uses base^(arange/dims), verified bit-exact).
+    return mx.power(
+        rope.base,
+        mx.arange(0, rope.dims, 2, dtype=mx.float32) / rope.dims,
+    )
+
+
+def _build_fused_qkv_native(attn):
+    """Build concatenated native-format q/k/v weights for a fused matmul.
+
+    Returns ``(wq, scales, biases, in_s, out_s)`` where the weights are
+    concatenated along the output dimension and ``out_s`` is a per-row array
+    (q rows and k/v rows may have different output SRQ scales).
+    """
+    cached = getattr(attn, "_fused_qkv_native", None)
+    if cached is not None:
+        return cached
+
+    q = _qlinear_native_args(attn.q_proj)
+    k = _qlinear_native_args(attn.k_proj)
+    v = _qlinear_native_args(attn.v_proj)
+    q_wq, q_sc, q_bi, q_in, q_out = q
+    k_wq, k_sc, k_bi, k_in, k_out = k
+    v_wq, v_sc, v_bi, v_in, v_out = v
+
+    wq = mx.concatenate([q_wq, k_wq, v_wq], axis=0)
+    scales = mx.concatenate([q_sc, k_sc, v_sc], axis=0)
+    biases = mx.concatenate([q_bi, k_bi, v_bi], axis=0)
+    in_s = q_in  # shared input SRQ scale
+
+    # Per-row output SRQ scale (broadcast scalars to per-row, zeros for no-SRQ).
+    dtype = q_out.dtype
+    parts = []
+    for proj, dim, s in (
+        (attn.q_proj, attn.q_proj.output_dims, q_out),
+        (attn.k_proj, attn.k_proj.output_dims, k_out),
+        (attn.v_proj, attn.v_proj.output_dims, v_out),
+    ):
+        if proj._has_output_scale:
+            parts.append(mx.broadcast_to(s.astype(dtype), (dim,)))
+        else:
+            parts.append(mx.zeros((dim,), dtype=dtype))
+    out_s = mx.concatenate(parts)
+
+    result = (wq, scales, biases, in_s, out_s)
+    object.__setattr__(attn, "_fused_qkv_native", result)
+    return result
+
+
+@lru_cache(maxsize=None)
+def _get_compiled_pre_attn_source(n_heads, head_dim, n_kv_heads):
+    """Factory: compiled pre-attention for source layers.
+
+    ``n_heads``, ``head_dim``, ``n_kv_heads`` are captured as Python constants
+    (needed for tensor slicing/reshaping inside the compiled graph).
+    """
+    qd = n_heads * head_dim
+    kvd = n_kv_heads * head_dim
+
+    @mx.compile
+    def _fn(
+        x,
+        input_norm_w, input_norm_eps,
+        qkv_wq, qkv_scales, qkv_biases, qkv_in_s, qkv_out_s,
+        q_norm_w, q_norm_eps,
+        k_norm_w, k_norm_eps,
+        v_norm_w, v_norm_eps,
+        rope_freqs, offset,
+    ):
+        h = mx.fast.rms_norm(x, input_norm_w, input_norm_eps).astype(mx.float32)
+        h = _srq(h, qkv_in_s)
+        qkv = mx.quantized_matmul(
+            h, qkv_wq, qkv_scales, qkv_biases,
+            group_size=_NATIVE_GROUP_SIZE, bits=4,
+        )
+        qkv = _srq(qkv, qkv_out_s).astype(x.dtype)
+        B, L, _ = qkv.shape
+        queries = qkv[..., :qd].reshape(B, L, n_heads, head_dim)
+        keys = qkv[..., qd : qd + kvd].reshape(B, L, n_kv_heads, head_dim)
+        values = qkv[..., qd + kvd :].reshape(B, L, n_kv_heads, head_dim)
+
+        queries = mx.fast.rms_norm(queries, q_norm_w, q_norm_eps)
+        keys = mx.fast.rms_norm(keys, k_norm_w, k_norm_eps)
+        values = mx.fast.rms_norm(values, v_norm_w, v_norm_eps)
+
+        keys = keys.transpose(0, 2, 1, 3)
+        keys = mx.fast.rope(
+            keys, head_dim, traditional=False, base=None, scale=1.0,
+            offset=offset, freqs=rope_freqs,
+        )
+        values = values.transpose(0, 2, 1, 3)
+        queries = queries.transpose(0, 2, 1, 3)
+        queries = mx.fast.rope(
+            queries, head_dim, traditional=False, base=None, scale=1.0,
+            offset=offset, freqs=rope_freqs,
+        )
+        return queries, keys, values
+
+    return _fn
+
+
+@lru_cache(maxsize=None)
+def _get_compiled_pre_attn_kvshared(n_heads, head_dim):
+    """Factory: compiled pre-attention for KV-shared layers."""
+
+    @mx.compile
+    def _fn(
+        x,
+        input_norm_w, input_norm_eps,
+        q_wq, q_scales, q_biases, q_in_s, q_out_s,
+        q_norm_w, q_norm_eps,
+        rope_freqs, offset,
+    ):
+        h = mx.fast.rms_norm(x, input_norm_w, input_norm_eps).astype(mx.float32)
+        h = _srq(h, q_in_s)
+        q = mx.quantized_matmul(
+            h, q_wq, q_scales, q_biases,
+            group_size=_NATIVE_GROUP_SIZE, bits=4,
+        )
+        q = _srq(q, q_out_s).astype(x.dtype)
+        B, L, _ = q.shape
+        queries = q.reshape(B, L, n_heads, head_dim)
+        queries = mx.fast.rms_norm(queries, q_norm_w, q_norm_eps)
+        queries = queries.transpose(0, 2, 1, 3)
+        queries = mx.fast.rope(
+            queries, head_dim, traditional=False, base=None, scale=1.0,
+            offset=offset, freqs=rope_freqs,
+        )
+        return queries
+
+    return _fn
+
+
+@lru_cache(maxsize=None)
+def _get_compiled_post_attn_mlp_ple(mlp_bits, ple_bits):
+    """Factory: compiled post-attention + MLP + PLE.
+
+    ``mlp_bits`` and ``ple_bits`` are captured as Python constants for
+    ``mx.quantized_matmul`` specialization.
+    """
+
+    @mx.compile
+    def _fn(
+        residual,
+        attn_output,
+        per_layer_input,
+        post_attn_w, post_attn_eps,
+        pre_ff_w, pre_ff_eps,
+        post_ff_w, post_ff_eps,
+        ple_norm_w, ple_norm_eps,
+        layer_scalar,
+        o_wq, o_scales, o_biases, o_in_s, o_out_s,
+        gate_wq, gate_scales, gate_biases, gate_in_s, gate_out_s,
+        up_wq, up_scales, up_biases, up_in_s, up_out_s,
+        down_wq, down_scales, down_biases, down_in_s, down_out_s,
+        ple_gwq, ple_gscales, ple_gbiases, ple_gin_s, ple_gout_s,
+        ple_pwq, ple_pscales, ple_pbiases, ple_pin_s, ple_pout_s,
+    ):
+        dt = attn_output.dtype
+
+        # Post-attention: o_proj → norm → residual
+        h = _srq(attn_output.astype(mx.float32), o_in_s)
+        h = mx.quantized_matmul(
+            h, o_wq, o_scales, o_biases,
+            group_size=_NATIVE_GROUP_SIZE, bits=4,
+        )
+        h = _srq(h, o_out_s).astype(dt)
+        h = mx.fast.rms_norm(h, post_attn_w, post_attn_eps)
+        h = residual + h
+
+        # MLP: pre_ff_norm → gate/up → gelu → down → post_ff_norm → residual
+        residual = h
+        h = mx.fast.rms_norm(h, pre_ff_w, pre_ff_eps).astype(mx.float32)
+        gate = mx.quantized_matmul(
+            _srq(h, gate_in_s), gate_wq, gate_scales, gate_biases,
+            group_size=_NATIVE_GROUP_SIZE, bits=mlp_bits,
+        )
+        gate = _srq(gate, gate_out_s).astype(dt)
+        up = mx.quantized_matmul(
+            _srq(h, up_in_s), up_wq, up_scales, up_biases,
+            group_size=_NATIVE_GROUP_SIZE, bits=mlp_bits,
+        )
+        up = _srq(up, up_out_s).astype(dt)
+        h = nn.gelu_approx(gate) * up
+        h = h.astype(mx.float32)
+        down = mx.quantized_matmul(
+            _srq(h, down_in_s), down_wq, down_scales, down_biases,
+            group_size=_NATIVE_GROUP_SIZE, bits=mlp_bits,
+        )
+        down = _srq(down, down_out_s).astype(dt)
+        h = mx.fast.rms_norm(down, post_ff_w, post_ff_eps)
+        h = residual + h
+
+        # Per-layer input (PLE): gate → gelu → multiply → proj → norm → residual
+        residual = h
+        h = h.astype(mx.float32)
+        gate = mx.quantized_matmul(
+            _srq(h, ple_gin_s), ple_gwq, ple_gscales, ple_gbiases,
+            group_size=_NATIVE_GROUP_SIZE, bits=ple_bits,
+        )
+        gate = _srq(gate, ple_gout_s).astype(dt)
+        gate = nn.gelu_approx(gate)
+        gate = mx.multiply(gate, per_layer_input)
+        gate = gate.astype(mx.float32)
+        gate = mx.quantized_matmul(
+            _srq(gate, ple_pin_s), ple_pwq, ple_pscales, ple_pbiases,
+            group_size=_NATIVE_GROUP_SIZE, bits=ple_bits,
+        )
+        gate = _srq(gate, ple_pout_s).astype(dt)
+        gate = mx.fast.rms_norm(gate, ple_norm_w, ple_norm_eps)
+        h = residual + gate
+
+        h = h * layer_scalar
+        return h
+
+    return _fn
 
 
 class MLP(nn.Module):
@@ -204,6 +730,7 @@ class Attention(nn.Module):
         cache: Optional[Any] = None,
         shared_kv: Optional[tuple] = None,
         offset: Optional[Any] = None,
+        return_attn_output: bool = False,
     ) -> mx.array:
         B, L, _ = x.shape
 
@@ -267,7 +794,22 @@ class Attention(nn.Module):
         )
         output = output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
+        if return_attn_output:
+            return output, (keys, values), offset
         return self.o_proj(output), (keys, values), offset
+
+    def attn_sdpa(self, queries, keys, values, cache, mask):
+        """Eager SDPA between the compiled pre/post-attention segments.
+
+        Takes already-transposed [B, heads, L, head_dim] queries/keys/values
+        and returns the reshaped attention output [B, L, hidden].
+        """
+        output = scaled_dot_product_attention(
+            queries, keys, values, cache=cache, scale=self.scale, mask=mask
+        )
+        B = output.shape[0]
+        L = output.shape[2]
+        return output.transpose(0, 2, 1, 3).reshape(B, L, -1)
 
 
 class DecoderLayer(nn.Module):
@@ -331,6 +873,106 @@ class DecoderLayer(nn.Module):
         # Layer scalar (all text layers)
         self.layer_scalar = mx.ones((1,))
 
+        # Native quantized_matmul compiled decode path (LiteRT-LM inspired).
+        # Usable when all relevant linear layers are gemma-quantized, there is
+        # no MoE, and all input dims are divisible by 128.  Weights are extracted
+        # lazily on first decode call.
+        self._native_args = None  # cached (is_source, pre_attn_args, post_attn_args) or False
+
+    def _get_native_args(self):
+        """Lazily extract and cache native compiled-path arguments.
+
+        Returns ``(is_source, pre_attn_args, post_attn_args)`` or ``False`` if
+        the native path is not usable (non-gemma layers, MoE, or dims not
+        divisible by 128).
+        """
+        if self._native_args is not None:
+            return self._native_args
+
+        attn = self.self_attn
+        mlp = self.mlp
+        ple_g = self.per_layer_input_gate
+        ple_p = self.per_layer_projection
+
+        # Check all relevant linear layers are gemma-quantized.
+        post_layers = [attn.o_proj, mlp.gate_proj, mlp.up_proj, mlp.down_proj, ple_g, ple_p]
+        if attn.is_kv_shared_layer:
+            pre_layers = [attn.q_proj]
+        else:
+            pre_layers = [attn.q_proj, attn.k_proj, attn.v_proj]
+        all_layers = post_layers + pre_layers
+        if not all(getattr(m, "mode", None) == "gemma" for m in all_layers):
+            self._native_args = False
+            return False
+
+        # Check all input dims divisible by 128 (MLX group_size constraint).
+        all_dims = [m.input_dims for m in all_layers]
+        if any(d % _NATIVE_GROUP_SIZE != 0 for d in all_dims):
+            self._native_args = False
+            return False
+
+        # Post-attention: get compiled fn (specialized by bit-widths) + args.
+        post_attn_fn = _get_compiled_post_attn_mlp_ple(
+            mlp.gate_proj.num_bits, ple_g.num_bits
+        )
+        post_attn_args = (
+            self.post_attention_layernorm.weight,
+            self.post_attention_layernorm.eps,
+            self.pre_feedforward_layernorm.weight,
+            self.pre_feedforward_layernorm.eps,
+            self.post_feedforward_layernorm.weight,
+            self.post_feedforward_layernorm.eps,
+            self.post_per_layer_input_norm.weight,
+            self.post_per_layer_input_norm.eps,
+            self.layer_scalar,
+            *_qlinear_native_args(attn.o_proj),
+            *_qlinear_native_args(mlp.gate_proj),
+            *_qlinear_native_args(mlp.up_proj),
+            *_qlinear_native_args(mlp.down_proj),
+            *_qlinear_native_args(ple_g),
+            *_qlinear_native_args(ple_p),
+        )
+
+        # Pre-attention: get compiled fn (specialized by shapes) + args.
+        rope_freqs = _get_rope_freqs(attn)
+        if attn.is_kv_shared_layer:
+            pre_attn_fn = _get_compiled_pre_attn_kvshared(
+                attn.n_heads, attn.head_dim
+            )
+            pre_attn_args = (
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+                *_qlinear_native_args(attn.q_proj),
+                attn.q_norm.weight,
+                attn.q_norm.eps,
+                rope_freqs,
+            )
+            is_source = False
+        else:
+            # v_norm is RMSNormNoScale (no weight) — use ones.
+            v_norm = attn.v_norm
+            v_norm_w = getattr(v_norm, "weight", None)
+            if v_norm_w is None:
+                v_norm_w = mx.ones((attn.head_dim,), dtype=attn.q_norm.weight.dtype)
+            pre_attn_fn = _get_compiled_pre_attn_source(
+                attn.n_heads, attn.head_dim, attn.n_kv_heads
+            )
+            pre_attn_args = (
+                self.input_layernorm.weight,
+                self.input_layernorm.eps,
+                *_build_fused_qkv_native(attn),
+                attn.q_norm.weight, attn.q_norm.eps,
+                attn.k_norm.weight, attn.k_norm.eps,
+                v_norm_w, v_norm.eps,
+                rope_freqs,
+            )
+            is_source = True
+
+        self._native_args = (
+            is_source, pre_attn_fn, pre_attn_args, post_attn_fn, post_attn_args
+        )
+        return self._native_args
+
     def __call__(
         self,
         x: mx.array,
@@ -342,6 +984,58 @@ class DecoderLayer(nn.Module):
     ) -> mx.array:
         residual = x
 
+        # Native quantized_matmul compiled path for both prefill (batch > 1) and
+        # decode (batch = 1).  Compiles pre-attention (norm + qkv + norms + rope)
+        # and post-attention (o_proj + norms + MLP + PLE + layer_scalar) using
+        # MLX's native quantized_matmul (compile-friendly, faster than the custom
+        # qmv/qmm kernel).  The KV cache update + SDPA stay eager between the two
+        # compiled segments.  The compiled functions use @mx.compile (per-shape);
+        # shapeless=True was attempted but fails because the pre-attention functions
+        # read .shape for tensor slicing (MLX cannot infer slice output shapes
+        # with unknown dimensions).
+        if (
+            not self.enable_moe
+            and per_layer_input is not None
+            and self.per_layer_input_gate is not None
+        ):
+            native = self._get_native_args()
+            if native:
+                (
+                    is_source, pre_attn_fn, pre_attn_args,
+                    post_attn_fn, post_attn_args,
+                ) = native
+                attn = self.self_attn
+
+                if is_source:
+                    # offset must be an mx.array (not a Python int) so that
+                    # @mx.compile treats it as a runtime input, not a constant.
+                    # Otherwise precompilation (cache=None → int 0) and real
+                    # prefill (cache → mx.array) compile different versions.
+                    offset = mx.array(cache.offset) if cache is not None else mx.array(0)
+                    queries, keys, values = pre_attn_fn(
+                        x, *pre_attn_args, offset
+                    )
+                    if cache is not None:
+                        keys, values = cache.update_and_fetch(keys, values)
+                    attn_output = attn.attn_sdpa(
+                        queries, keys, values, cache, mask
+                    )
+                    shared_kv = (keys, values)
+                else:
+                    if offset is None:
+                        offset = mx.array(0)
+                    queries = pre_attn_fn(x, *pre_attn_args, offset)
+                    kv = shared_kv if shared_kv is not None else (None, None)
+                    attn_output = attn.attn_sdpa(
+                        queries, kv[0], kv[1], None, mask
+                    )
+
+                h = post_attn_fn(
+                    residual, attn_output, per_layer_input, *post_attn_args
+                )
+                return h, shared_kv, offset
+
+        # Eager path (MoE, non-gemma-quantized, or no PLE)
         h = self.input_layernorm(x)
         h, shared_kv, offset = self.self_attn(
             h, mask, cache, shared_kv=shared_kv, offset=offset
@@ -653,6 +1347,19 @@ class Gemma4TextModel(nn.Module):
             if hidden_sink is not None and idx in capture_set:
                 hidden_sink.append(h)
 
+        # Weight conversion is lazy (triggered by _get_native_args inside
+        # each layer).  We free the mobile-format weights on the SECOND forward
+        # pass (first decode step), not the first (prefill), so the prefill
+        # has zero mx.eval overhead.  By the second pass, the prefill's matmuls
+        # have already evaluated the native weights, so the mx.eval inside
+        # _free_mobile_weights is a no-op.
+        if getattr(self, "_weights_converted", False):
+            if not getattr(self, "_mobile_weights_freed", False):
+                _free_mobile_weights(self)
+                object.__setattr__(self, "_mobile_weights_freed", True)
+        else:
+            object.__setattr__(self, "_weights_converted", True)
+
         if shared_kv_sink is not None:
             for idx, layer in enumerate(self.layers):
                 kvs, _ = intermediates[idx]
@@ -689,6 +1396,26 @@ class LanguageModel(nn.Module):
         self.tie_word_embeddings = getattr(config, "tie_word_embeddings", True)
         if not self.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        # Lazily built compiled decode fast-path (LiteRT-LM inspired; opt-in via
+        # MLX_VLM_FAST_DECODE=1).  See models/gemma4/fast_decode.py.
+        self._fast_decode_fn = None
+        self._fast_decode_src = None
+
+    def init_fast_decode(self, prompt_cache):
+        """Extract the flattened KV state from the eager cache after prefill.
+
+        Returns a ``FastDecodeState`` (or ``None`` if the fast path is not
+        usable).  Used by ``generate_step`` when ``MLX_VLM_FAST_DECODE=1``.
+        """
+        from .fast_decode import init_fast_decode
+
+        return init_fast_decode(self, prompt_cache)
+
+    def fast_decode_step(self, state, token: mx.array):
+        """Run one compiled single-token decode step; update ``state`` in place."""
+        from .fast_decode import fast_decode_step
+
+        return fast_decode_step(self, state, token)
 
     def logits_from_hidden(self, hidden: mx.array) -> mx.array:
         if self.tie_word_embeddings:
