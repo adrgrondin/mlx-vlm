@@ -341,17 +341,6 @@ def precompile_native_functions(model, shapes=(1, 16, 32, 64, 128, 256)):
                     pass
 
 
-def _qlinear_args(m):
-    """Extract mobile-format arguments for ``gemma_mobile_matmul`` (fallback)."""
-    in_s = m.input_activation_scale if m._has_input_scale else mx.array(
-        [0.0], dtype=m.weight_scale.dtype
-    )
-    out_s = m.output_activation_scale if m._has_output_scale else mx.array(
-        [0.0], dtype=m.weight_scale.dtype
-    )
-    return (m.weight, m.weight_scale, m.num_bits, m.input_dims, in_s, out_s)
-
-
 def _get_rope_freqs(attn):
     """Extract rope frequencies for compiled functions.
 
@@ -914,6 +903,17 @@ class DecoderLayer(nn.Module):
         # Check all input dims divisible by 128 (MLX group_size constraint).
         all_dims = [m.input_dims for m in all_layers]
         if any(d % _NATIVE_GROUP_SIZE != 0 for d in all_dims):
+            self._native_args = False
+            return False
+
+        # The compiled pre/post-attention functions hardcode bits=4 for the
+        # attention projections (q/k/v/o); MLP and PLE bits are parameterized.
+        # Guard non-4-bit attention so a non-standard config falls back to the
+        # eager path instead of silently computing with the wrong bit width.
+        _attn_linears = [attn.q_proj, attn.o_proj]
+        if not attn.is_kv_shared_layer:
+            _attn_linears += [attn.k_proj, attn.v_proj]
+        if any(m.num_bits != 4 for m in _attn_linears):
             self._native_args = False
             return False
 
@@ -1650,5 +1650,8 @@ class LanguageModel(nn.Module):
             else:
                 caches.append(
                     RotatingKVCache(
-                        max_size=self.config.sliding_window, keep=0))
+                        max_size=self.config.sliding_window,
+                        keep=0,
+                    )
+                )
         return caches

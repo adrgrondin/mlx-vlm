@@ -206,6 +206,12 @@ def init_fast_decode(lm, prompt_cache) -> Optional[FastDecodeState]:
 
     Returns ``None`` if the fast path is not usable (e.g. no source-layer caches).
     """
+    # The fast path uses the mobile-format custom kernels (gemma_mobile_matmul),
+    # which need the packed weights.  The native compiled path frees them at load
+    # time (precompile_native_functions), so the two are incompatible — bail out
+    # and let the eager native path handle decode instead of reading zeroed weights.
+    if getattr(lm.model, "_mobile_weights_freed", False):
+        return None
     src_layers = _source_layers(lm)
     if not src_layers or len(prompt_cache) < len(src_layers):
         return None
